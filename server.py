@@ -10,7 +10,7 @@ Env vars required:
   SMTP_PASS      — app password
   SMTP_FROM      — your@gmail.com
 """
-import asyncio, json, hashlib, hmac as hmac_lib, datetime, os, random, string, smtplib, http
+import asyncio, json, hashlib, hmac as hmac_lib, datetime, os, random, string, smtplib
 from email.mime.text import MIMEText
 
 try:
@@ -20,10 +20,6 @@ except ImportError:
     import subprocess, sys
     subprocess.run([sys.executable,"-m","pip","install","websockets","asyncpg","--break-system-packages","-q"])
     import websockets, asyncpg
-
-# Импортируем необходимые компоненты для кастомного HTTP-обработчика
-from websockets.server import WebSocketServerProtocol
-from websockets.http11 import Response
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 SMTP_HOST  = os.environ.get("SMTP_HOST",  "smtp.gmail.com")
@@ -107,35 +103,6 @@ async def broadcast(msg_dict):
     payload = json.dumps(msg_dict)
     await asyncio.gather(*[ws.send(payload) for ws in clients], return_exceptions=True)
 
-
-# Кастомный класс протокола для перехвата HEAD/GET запросов от Render до валидации WebSocket
-class RenderHealthCheckProtocol(WebSocketServerProtocol):
-    async def parse(self):
-        try:
-            return await super().parse()
-        except Exception as exc:
-            # Извлекаем изначальную ошибку, если она вызвана методом HEAD или не-WebSocket GET запросом
-            raw_exc = exc.__cause__ if exc.__cause__ else exc
-            if isinstance(raw_exc, ValueError) and "unsupported HTTP method" in str(raw_exc):
-                # Если Render стучится через HEAD
-                self.write_http_response(http.HTTPStatus.OK, [], b"OK")
-                self.transport.close()
-                raise asyncio.CancelledError()
-            elif isinstance(exc, websockets.exceptions.InvalidMessage) and "did not receive a valid HTTP request" in str(exc):
-                # Если это был обычный HTTP GET (не WebSocket) на корень сайта
-                self.write_http_response(http.HTTPStatus.OK, [], b"OK")
-                self.transport.close()
-                raise asyncio.CancelledError()
-            raise exc
-
-    def write_http_response(self, status, headers, body):
-        try:
-            response = Response(status, status.phrase, websockets.http11.Headers(headers), body)
-            response.write(self.transport.write)
-        except Exception:
-            pass
-
-
 async def handler(websocket):
     try:
         async for message in websocket:
@@ -216,6 +183,32 @@ async def handler(websocket):
             print(f"[-] {name} left")
             await broadcast({"type":"system","text":f"{name} покинул чат.","users":online_users()})
 
+
+# ── Простой HTTP Health-Check Сервер для Render ───────────────
+async def handle_render_http(reader, writer):
+    """Слушает сырые HTTP запросы и моментально отвечает 200 OK на HEAD/GET"""
+    try:
+        data = await reader.readuntil(b"\r\n\r\n")
+        request_line = data.decode().split("\r\n")[0]
+    except Exception:
+        request_line = ""
+
+    # Если это HEAD или GET-запрос от балансировщика
+    if "HEAD" in request_line or "GET" in request_line:
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 2\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "OK"
+        )
+        writer.write(response.encode())
+        await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+
 # ── Main ─────────────────────────────────────────────────────
 async def main():
     if not DB_URL:
@@ -225,12 +218,29 @@ async def main():
     else:
         await init_db()
 
+    # Берем порт, который дает нам Render
     port = int(os.environ.get("PORT", 8765))
+    
     print(f"Salam server on :{port}")
     
-    # Запускаем сервер, используя наш кастомный класс протокола для прохождения проверок Render
-    async with websockets.serve(handler, "0.0.0.0", port, create_protocol=RenderHealthCheckProtocol):
-        await asyncio.Future()
+    # 1. Запускаем WebSocket-сервер БЕЗ лишних параметров
+    ws_server = await websockets.serve(handler, "0.0.0.0", port)
+    
+    # 2. Запускаем рядом легкий TCP/HTTP обработчик на том же порту (благодаря сокетам websockets),
+    # либо, если websockets занял порт эксклюзивно, Render проверяет HTTP-трафик там же.
+    # Чтобы не конфликтовать за порт, мы перехватываем проверку прямо внутри одной петли.
+    # Если на Render используется схема единого порта, websockets версии 16 позволяет обрабатывать HTTP через параметр 'process_request' на верхнем уровне, но теперь в асинхронном стиле:
+    
+    # Переопределим поведение ws_server для обработки обычных HTTP-запросов (healthcheck)
+    async def process_request(connection, request):
+        if request.method in ("HEAD", "GET") and request.path == "/":
+            return connection.respond(http.HTTPStatus.OK, b"OK")
+        return None
+
+    ws_server.process_request = process_request
+
+    # Оставляем сервер работать бесконечно
+    await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
