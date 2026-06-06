@@ -25,7 +25,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 SMTP_HOST  = os.environ.get("SMTP_HOST",  "smtp.gmail.com")
 SMTP_PORT  = int(os.environ.get("SMTP_PORT", 587))
 SMTP_USER  = os.environ.get("SMTP_USER",  "rakhmet.danial2000@gmail.com")
-SMTP_PASS  = os.environ.get("SMTP_PASS",  ""pfve xwbr zfoi bemy)
+SMTP_PASS  = os.environ.get("SMTP_PASS",  "pfve xwbr zfoi bemy")
 SMTP_FROM  = os.environ.get("SMTP_FROM",  SMTP_USER)
 DB_URL     = os.environ.get("DATABASE_URL", "postgresql://salam_db_2v1p_user:gcABVaPlAzRxHqFudVQL1IUruYqjRzLU@dpg-d8hqlc5dt1ts73ejkl80-a/salam_db_2v1p")
 
