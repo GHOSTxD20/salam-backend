@@ -21,6 +21,10 @@ except ImportError:
     subprocess.run([sys.executable,"-m","pip","install","websockets","asyncpg","--break-system-packages","-q"])
     import websockets, asyncpg
 
+# Импортируем необходимые компоненты для кастомного HTTP-обработчика
+from websockets.server import WebSocketServerProtocol
+from websockets.http11 import Response
+
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
 SMTP_HOST  = os.environ.get("SMTP_HOST",  "smtp.gmail.com")
 SMTP_PORT  = int(os.environ.get("SMTP_PORT", 587))
@@ -103,13 +107,34 @@ async def broadcast(msg_dict):
     payload = json.dumps(msg_dict)
     await asyncio.gather(*[ws.send(payload) for ws in clients], return_exceptions=True)
 
-# Перехватчик HTTP-запросов (Health Check) для предотвращения падения на Render.com
-async def health_check(connection, request):
-    # Если Render проверяет доступность через HEAD или GET на корень сайта "/"
-    if request.method == "HEAD" or request.path == "/":
-        # Возвращаем стандартный ответ 200 OK, подтверждающий, что порт слушается
-        return http.HTTPStatus.OK, [("Content-Type", "text/plain")], b"OK"
-    return None # Если это WebSocket-handshake (GET с Upgrade), передаем управление дальше
+
+# Кастомный класс протокола для перехвата HEAD/GET запросов от Render до валидации WebSocket
+class RenderHealthCheckProtocol(WebSocketServerProtocol):
+    async def parse(self):
+        try:
+            return await super().parse()
+        except Exception as exc:
+            # Извлекаем изначальную ошибку, если она вызвана методом HEAD или не-WebSocket GET запросом
+            raw_exc = exc.__cause__ if exc.__cause__ else exc
+            if isinstance(raw_exc, ValueError) and "unsupported HTTP method" in str(raw_exc):
+                # Если Render стучится через HEAD
+                self.write_http_response(http.HTTPStatus.OK, [], b"OK")
+                self.transport.close()
+                raise asyncio.CancelledError()
+            elif isinstance(exc, websockets.exceptions.InvalidMessage) and "did not receive a valid HTTP request" in str(exc):
+                # Если это был обычный HTTP GET (не WebSocket) на корень сайта
+                self.write_http_response(http.HTTPStatus.OK, [], b"OK")
+                self.transport.close()
+                raise asyncio.CancelledError()
+            raise exc
+
+    def write_http_response(self, status, headers, body):
+        try:
+            response = Response(status, status.phrase, websockets.http11.Headers(headers), body)
+            response.write(self.transport.write)
+        except Exception:
+            pass
+
 
 async def handler(websocket):
     try:
@@ -202,8 +227,9 @@ async def main():
 
     port = int(os.environ.get("PORT", 8765))
     print(f"Salam server on :{port}")
-    # Подключаем health_check через параметр process_request
-    async with websockets.serve(handler, "0.0.0.0", port, process_request=health_check):
+    
+    # Запускаем сервер, используя наш кастомный класс протокола для прохождения проверок Render
+    async with websockets.serve(handler, "0.0.0.0", port, create_protocol=RenderHealthCheckProtocol):
         await asyncio.Future()
 
 if __name__ == "__main__":
